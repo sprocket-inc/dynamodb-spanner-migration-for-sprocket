@@ -71,6 +71,8 @@ import org.joda.time.Duration;
 public class SpannerStreamingWrite {
 
   private static final Logger LOG = LoggerFactory.getLogger(SpannerStreamingWrite.class);
+  static final TupleTag<Item> validTag = new TupleTag<Item>(){};
+  static final TupleTag<String> invalidTag = new TupleTag<String>(){};
 
   public interface Options extends PipelineOptions {
 
@@ -92,6 +94,12 @@ public class SpannerStreamingWrite {
 
     void setTable(String value);
 
+    @Description("Service ID to write to")
+    @Validation.Required
+    String getServiceId();
+
+    void setServiceId(String value);
+
     @Description("Pub/Sub Subscription with streaming changes (full subscription path reqd")
     @Validation.Required
     String getSubscription();
@@ -111,9 +119,6 @@ public class SpannerStreamingWrite {
     void setDeadLetterBucket(String value);
   }
 
-  static final TupleTag<Item> validRecordsTag = new TupleTag<Item>(){};
-  static final TupleTag<String> deadLetterTag = new TupleTag<String>(){};
-
   static class CreateUpdateItems extends DoFn<String, Item> {
 
     @ProcessElement
@@ -121,12 +126,14 @@ public class SpannerStreamingWrite {
       try {
         JsonObject json = JsonParser.parseString(c.element()).getAsJsonObject();
         if (json.has("NewImage")) {
-          LOG.info("received a create/update");
-          c.output(validRecordsTag, new Gson().fromJson(json.getAsJsonObject("NewImage"), Item.class));
+          LOG.warn("received a create/update");
+          LOG.warn(json.getAsJsonObject("NewImage").toString());
+          LOG.warn(validTag.toString());
+          c.output(validTag, new Gson().fromJson(json.getAsJsonObject("NewImage"), Item.class));
         }
       } catch (Exception e) {
         LOG.error("Error parsing record: " + c.element(), e);
-        c.output(deadLetterTag, c.element());
+        c.output(invalidTag, c.element());
       }
     }
   }
@@ -138,12 +145,14 @@ public class SpannerStreamingWrite {
       try {
         JsonObject json = JsonParser.parseString(c.element()).getAsJsonObject();
         if (!json.has("NewImage")) {
-          LOG.info("received a delete");
-          c.output(validRecordsTag, new Gson().fromJson(json.getAsJsonObject("Keys"), Item.class));
+          LOG.warn("received a delete");
+          LOG.warn(json.getAsJsonObject("Keys").toString());
+          LOG.warn(validTag.toString());
+          c.output(validTag, new Gson().fromJson(json.getAsJsonObject("Keys"), Item.class));
         }
       } catch (Exception e) {
         LOG.error("Error parsing record: " + c.element(), e);
-        c.output(deadLetterTag, c.element());
+        c.output(invalidTag, c.element());
       }
     }
   }
@@ -151,9 +160,11 @@ public class SpannerStreamingWrite {
   static class UpdateMutations extends DoFn<Item, Mutation> {
 
     String table;
+    String serviceId;
 
-    public UpdateMutations(String table) {
+    public UpdateMutations(String table,String serviceId) {
       this.table = table;
+      this.serviceId = serviceId;
     }
 
     @ProcessElement
@@ -163,7 +174,7 @@ public class SpannerStreamingWrite {
 
       try {
         mutation.set("userId").to(item.object_id.S);
-        mutation.set("serviceId").to(item.service_id.S);
+        mutation.set("serviceId").to(serviceId);
         mutation.set("name").to(item.attr_name.S);
         mutation.set("lastUpdate").to(item.attr_time.N);
 
@@ -189,7 +200,7 @@ public class SpannerStreamingWrite {
 
       } catch (Exception ex) {
         LOG.error("Unable to create mutation for record: " + item, ex);
-        c.output(deadLetterTag, new Gson().toJson(item));
+        c.output(invalidTag, new Gson().toJson(item));
       }
     }
   }
@@ -197,20 +208,22 @@ public class SpannerStreamingWrite {
   static class DeleteMutations extends DoFn<Item, Mutation> {
 
     String table;
+    String serviceId;
 
-    public DeleteMutations(String table) {
+    public DeleteMutations(String table,String serviceId) {
       this.table = table;
+      this.serviceId = serviceId;
     }
 
     @ProcessElement
     public void processElement(ProcessContext c) {
       try {
         Item item = c.element();
-        Mutation mutation = Mutation.delete(table, com.google.cloud.spanner.Key.of(item.service_id.S,item.object_id.S,item.attr_name.S));
+        Mutation mutation = Mutation.delete(table, com.google.cloud.spanner.Key.of(serviceId,item.object_id.S,item.attr_name.S));
         c.output(mutation);
       } catch (Exception e) {
         LOG.error("Error parsing record: " + c.element(), e);
-        c.output(deadLetterTag, c.element().toString());
+        c.output(invalidTag, c.element().toString());
       }
     }
   }
@@ -224,22 +237,22 @@ public class SpannerStreamingWrite {
         PubsubIO.readStrings().fromSubscription(options.getSubscription()));
 
     PCollectionTuple parsedCreateUpdate = messages.apply("Create-or-Update?",
-        ParDo.of(new CreateUpdateItems()).withOutputTags(validRecordsTag, TupleTagList.of(deadLetterTag)));
+        ParDo.of(new CreateUpdateItems()).withOutputTags(validTag, TupleTagList.of(invalidTag)));
 
     PCollectionTuple parsedDelete = messages.apply("Delete?",
-        ParDo.of(new DeleteItems()).withOutputTags(validRecordsTag, TupleTagList.of(deadLetterTag)));
+        ParDo.of(new DeleteItems()).withOutputTags(validTag, TupleTagList.of(invalidTag)));
 
-    PCollection<Item> validCreateUpdateRecords = parsedCreateUpdate.get(validRecordsTag);
-    PCollection<Item> validDeleteRecords = parsedDelete.get(validRecordsTag);
-    PCollection<String> deadLetters = PCollectionList.of(parsedCreateUpdate.get(deadLetterTag))
-        .and(parsedDelete.get(deadLetterTag))
+    PCollection<Item> validCreateUpdateRecords = parsedCreateUpdate.get(validTag);
+    PCollection<Item> validDeleteRecords = parsedDelete.get(validTag);
+    PCollection<String> deadLetters = PCollectionList.of(parsedCreateUpdate.get(invalidTag))
+        .and(parsedDelete.get(invalidTag))
         .apply(Flatten.pCollections());
 
     PCollection<Mutation> updates = validCreateUpdateRecords.apply("CU->Mutations",
-        ParDo.of(new UpdateMutations(options.getTable())));
+        ParDo.of(new UpdateMutations(options.getTable(),options.getServiceId())));
 
     PCollection<Mutation> deletes = validDeleteRecords.apply("D->Mutations",
-        ParDo.of(new DeleteMutations(options.getTable())));
+        ParDo.of(new DeleteMutations(options.getTable(),options.getServiceId())));
 
     PCollectionList<Mutation> merged = PCollectionList.of(updates).and(deletes);
 
@@ -270,7 +283,6 @@ public class SpannerStreamingWrite {
 
   public static class Item implements Serializable {
     private ObjectId object_id;
-    private ServiceId service_id;
     private AttrName attr_name;
     private AttrTime attr_time;
     private AttrString attr_string;
@@ -278,10 +290,6 @@ public class SpannerStreamingWrite {
   }
 
   public static class ObjectId implements Serializable {
-    private String S;
-  }
-
-  public static class ServiceId implements Serializable {
     private String S;
   }
 

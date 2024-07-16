@@ -1,15 +1,21 @@
 include .env
 export $(shell sed 's/=.*//' .env)
 
-ifeq ($(GCP_PROJECT_ID), sprocket)
+ifeq ($(GCP_PROJECT_ID), sprocket-evaluation2)
   DYNAMO_DB_TABLE_NAME := v2-sprocket-${SERVICE_ID}_game_table
+  SPANNER_INSTANCE_ID := tfgen-spanid-20240522052017533
 else
   DYNAMO_DB_TABLE_NAME := stg-v2-sprocket-${SERVICE_ID}_game_table
+  SPANNER_INSTANCE_ID := tfgen-spanid-20240514075746935
 endif
 AWS_ACCOUNT_ID := $(shell aws sts get-caller-identity --query "Account" --output text)
 
 .PHONY: export-dynamodb-to-s3
 export-dynamodb-to-s3:
+	gcloud pubsub topics create spanner-migration-${SERVICE_ID}
+	gcloud pubsub subscriptions create spanner-migration-${SERVICE_ID} \
+    --topic spanner-migration-${SERVICE_ID}
+	export AWS_PAGER=""; \
 	aws dynamodb update-continuous-backups \
 		--table-name ${DYNAMO_DB_TABLE_NAME} \
 		--point-in-time-recovery-specification PointInTimeRecoveryEnabled=true
@@ -33,55 +39,54 @@ export-dynamodb-to-s3:
 
 .PHONY: reset-dynamodb-settings
 reset-dynamodb-settings:
-	aws dynamodb update-table \
-		--table-name ${DYNAMO_DB_TABLE_NAME} \
-		--stream-specification StreamEnabled=false
 	aws dynamodb update-continuous-backups \
 		--table-name ${DYNAMO_DB_TABLE_NAME} \
 		--point-in-time-recovery-specification PointInTimeRecoveryEnabled=false
 
 .PHONY: transfer-to-gcs
 transfer-to-gcs:
-	echo '{ "roleArn": "arn:aws:iam::$(AWS_ACCOUNT_ID):role/assume_role_for_sprocket_poc" }' > credential.json
-	JOB_NAME=$$(gcloud transfer jobs create \
+	echo '{ "roleArn": "arn:aws:iam::$(AWS_ACCOUNT_ID):role/assume_role_for_spanner_migration" }' > credential.json
+	gcloud transfer jobs create \
 		s3://${S3_BUCKET_NAME}/${SERVICE_ID}/ \
 		gs://${GCS_BUCKET_NAME}/${SERVICE_ID}/\
 		--source-creds-file credential.json \
-		--format="value(name)")
-	gcloud transfer jobs run ${JOB_NAME} 
+		--format="value(name)"
 
 .PHONY: bulk-write
 bulk-write:
-	cd dataflow &&\
-	mvn compile &&\
+	cd dataflow && \
+	mvn compile && \
 	mvn exec:java \
-		-Dexec.mainClass=com.example.spanner_migration.SpannerBulkWrite \
-		-Pdataflow-runner \
-		-Dexec.args="--project=${GCP_PROJECT_ID} \
-					--instanceId=user_state \
-					--databaseId=user_state \
-					--table=states \
-					--serviceId=${SERVICE_ID} \
-					--importBucket=${GCS_BUCKET_NAME} \
-					--deadLetterBucket=${GCS_DLQ_BUCKET} \
-					--runner=DataflowRunner \
-					--region=asia-northeast1 \
-					--maxNumWorkers=${MAX_NUM_WORKERS}"
+	-Dexec.mainClass=com.example.spanner_migration.SpannerBulkWrite \
+	-Pdataflow-runner \
+	-Dexec.args="--project=${GCP_PROJECT_ID} \
+	--instanceId=${SPANNER_INSTANCE_ID} \
+	--databaseId=user_state \
+	--table=states \
+	--serviceId=${SERVICE_ID} \
+	--importBucket=${GCS_BUCKET_NAME} \
+	--deadLetterBucket=${GCS_DLQ_BUCKET} \
+	--runner=DataflowRunner \
+	--region=asia-northeast1 \
+	--maxNumWorkers=${MAX_NUM_WORKERS} \
+	--jobName=spanner-bulk-write-${SERVICE_ID}"
 
 .PHONY: streaming-write
 streaming-write:
 	cd dataflow &&\
 	mvn compile &&\
 	mvn exec:java \
-		-Dexec.mainClass=com.example.spanner_migration.SpannerStreamingWrite \
-		-Pdataflow-runner \
-		-Dexec.args="--project=${GCP_PROJECT_ID} \
-					--subscription=projects/${GCP_PROJECT_ID}/subscriptions/spanner-migration \
-					--instanceId=user_states \
-					--databaseId=user_states \
-					--table=states \
-					--deadLetterBucket=${GCS_DLQ_BUCKET} \
-					--experiments=allow_non_updatable_job \
-					--runner=DataflowRunner \
-					--region=asia-northeast1 \
-					--maxNumWorkers=${MAX_NUM_WORKERS}"
+	-Dexec.mainClass=com.example.spanner_migration.SpannerStreamingWrite \
+	-Pdataflow-runner \
+	-Dexec.args="--project=${GCP_PROJECT_ID} \
+	--subscription=projects/${GCP_PROJECT_ID}/subscriptions/spanner-migration-${SERVICE_ID} \
+	--instanceId=${SPANNER_INSTANCE_ID} \
+	--databaseId=user_state \
+	--serviceId=${SERVICE_ID} \
+	--table=states \
+	--deadLetterBucket=${GCS_DLQ_BUCKET} \
+	--experiments=allow_non_updatable_job \
+	--runner=DataflowRunner \
+	--region=asia-northeast1 \
+	--maxNumWorkers=${MAX_NUM_WORKERS} \
+	--jobName=spanner-streaming-write-${SERVICE_ID}"
