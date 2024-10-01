@@ -15,18 +15,17 @@ export-dynamodb-to-s3:
 	gcloud pubsub topics create spanner-migration-${SERVICE_ID}
 	gcloud pubsub subscriptions create spanner-migration-${SERVICE_ID} \
     --topic spanner-migration-${SERVICE_ID}
-	export AWS_PAGER=""; \
-	aws dynamodb update-continuous-backups \
+	AWS_PAGER='' aws dynamodb update-continuous-backups \
 		--table-name ${DYNAMO_DB_TABLE_NAME} \
 		--point-in-time-recovery-specification PointInTimeRecoveryEnabled=true
-	aws dynamodb update-table \
+	AWS_PAGER='' aws dynamodb update-table \
 		--table-name ${DYNAMO_DB_TABLE_NAME} \
 		--stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES
 	STREAMARN=$$(aws dynamodb describe-table \
 		--table-name ${DYNAMO_DB_TABLE_NAME} \
 		--query "Table.LatestStreamArn" \
 		--output text) &&\
-	aws lambda create-event-source-mapping \
+	AWS_PAGER='' aws lambda create-event-source-mapping \
 		--event-source-arn $${STREAMARN} \
 		--function-name dynamodb-spanner-lambda \
 		--enabled \
@@ -37,14 +36,11 @@ export-dynamodb-to-s3:
 		--s3-prefix ${SERVICE_ID} \
 		--export-format DYNAMODB_JSON
 
-.PHONY: reset-dynamodb-settings
-reset-dynamodb-settings:
+.PHONY: transfer-to-gcs
+transfer-to-gcs:
 	aws dynamodb update-continuous-backups \
 		--table-name ${DYNAMO_DB_TABLE_NAME} \
 		--point-in-time-recovery-specification PointInTimeRecoveryEnabled=false
-
-.PHONY: transfer-to-gcs
-transfer-to-gcs:
 	echo '{ "roleArn": "arn:aws:iam::$(AWS_ACCOUNT_ID):role/assume_role_for_spanner_migration" }' > credential.json
 	gcloud transfer jobs create \
 		s3://${S3_BUCKET_NAME}/${SERVICE_ID}/ \
@@ -69,7 +65,8 @@ bulk-write:
 	--runner=DataflowRunner \
 	--region=asia-northeast1 \
 	--maxNumWorkers=${MAX_NUM_WORKERS} \
-	--jobName=spanner-bulk-write-${SERVICE_ID}"
+	--jobName=spanner-bulk-write-${SERVICE_ID} \
+	--labels='{\"datadog-disabled\": \"true\"}'" &
 
 .PHONY: streaming-write
 streaming-write:
@@ -89,4 +86,22 @@ streaming-write:
 	--runner=DataflowRunner \
 	--region=asia-northeast1 \
 	--maxNumWorkers=${MAX_NUM_WORKERS} \
-	--jobName=spanner-streaming-write-${SERVICE_ID}"
+	--jobName=spanner-streaming-write-${SERVICE_ID} \
+	--labels='{\"datadog-disabled\": \"true\"}'" &
+
+.PHONY: drain-job
+drain-job:
+	UUID=$$(aws lambda list-event-source-mappings | jq -r '.EventSourceMappings[] | \
+	 select(.EventSourceArn | contains("${DYNAMO_DB_TABLE_NAME}")) | .UUID') &&\
+	AWS_PAGER='' aws lambda delete-event-source-mapping --uuid $${UUID}
+	AWS_PAGER='' aws dynamodb update-table \
+    --table-name ${DYNAMO_DB_TABLE_NAME} \
+    --stream-specification StreamEnabled=false
+	JOB_ID=$$(gcloud dataflow jobs list --status=active \
+	--filter="name=spanner-streaming-write-${SERVICE_ID}" --format="value(JOB_ID)" --region="asia-northeast1") &&\
+	gcloud dataflow jobs drain $${JOB_ID} --region="asia-northeast1"
+
+.PHONY: close-pubsub
+close-pubsub:
+	gcloud pubsub topics delete spanner-migration-${SERVICE_ID}
+	gcloud pubsub subscriptions delete spanner-migration-${SERVICE_ID}
