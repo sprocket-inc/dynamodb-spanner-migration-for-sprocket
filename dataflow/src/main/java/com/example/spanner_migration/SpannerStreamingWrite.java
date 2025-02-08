@@ -14,35 +14,6 @@
  * limitations under the License.
  */
 
-package com.example.spanner_migration;
-
-import com.google.cloud.Date;
-import com.google.cloud.spanner.Mutation;
-import com.google.gson.Gson;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import java.io.Serializable;
-import java.util.Optional;
-import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.io.gcp.pubsub.PubsubIO;
-import org.apache.beam.sdk.io.gcp.spanner.SpannerIO;
-import org.apache.beam.sdk.options.Default;
-import org.apache.beam.sdk.options.Description;
-import org.apache.beam.sdk.options.PipelineOptions;
-import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.sdk.options.Validation;
-import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.sdk.transforms.Flatten;
-import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.windowing.AfterProcessingTime;
-import org.apache.beam.sdk.transforms.windowing.FixedWindows;
-import org.apache.beam.sdk.transforms.windowing.Window;
-import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.sdk.values.PCollectionList;
-import org.joda.time.Duration;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 /*
 ## How to run
 mvn clean
@@ -60,10 +31,48 @@ mvn exec:java \
                  --region=my-gcp-region"
 */
 
-@SuppressWarnings("serial")
+package com.example.spanner_migration;
+
+import com.google.cloud.Date;
+import com.google.cloud.spanner.Mutation;
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import java.io.Serializable;
+import java.util.Optional;
+import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.io.gcp.pubsub.PubsubIO;
+import org.apache.beam.sdk.io.gcp.spanner.SpannerIO;
+import org.apache.beam.sdk.io.TextIO;
+import org.apache.beam.sdk.options.Default;
+import org.apache.beam.sdk.options.Description;
+import org.apache.beam.sdk.options.PipelineOptions;
+import org.apache.beam.sdk.options.PipelineOptionsFactory;
+import org.apache.beam.sdk.options.Validation;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.Flatten;
+import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.windowing.AfterProcessingTime;
+import org.apache.beam.sdk.transforms.windowing.FixedWindows;
+import org.apache.beam.sdk.transforms.windowing.Window;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
+import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.TupleTagList;
+import org.joda.time.Duration;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.apache.beam.sdk.transforms.windowing.FixedWindows;
+import org.apache.beam.sdk.transforms.windowing.Window;
+import org.joda.time.Duration;
+
+
 public class SpannerStreamingWrite {
 
   private static final Logger LOG = LoggerFactory.getLogger(SpannerStreamingWrite.class);
+  static final TupleTag<Item> validTag = new TupleTag<Item>(){};
+  static final TupleTag<String> invalidTag = new TupleTag<String>(){};
 
   public interface Options extends PipelineOptions {
 
@@ -85,6 +94,12 @@ public class SpannerStreamingWrite {
 
     void setTable(String value);
 
+    @Description("Service ID to write to")
+    @Validation.Required
+    String getServiceId();
+
+    void setServiceId(String value);
+
     @Description("Pub/Sub Subscription with streaming changes (full subscription path reqd")
     @Validation.Required
     String getSubscription();
@@ -97,16 +112,28 @@ public class SpannerStreamingWrite {
 
     void setWindow(String value);
 
+    @Description("GCS bucket for dead letters")
+    @Validation.Required
+    String getDeadLetterBucket();
+
+    void setDeadLetterBucket(String value);
   }
 
   static class CreateUpdateItems extends DoFn<String, Item> {
 
     @ProcessElement
     public void processElement(ProcessContext c) {
-      JsonObject json = JsonParser.parseString(c.element()).getAsJsonObject();
-      if (json.has("NewImage")) {
-        LOG.info("received a create/update");
-        c.output(new Gson().fromJson(json.getAsJsonObject("NewImage"), Item.class));
+      try {
+        JsonObject json = JsonParser.parseString(c.element()).getAsJsonObject();
+        if (json.has("NewImage")) {
+          LOG.warn("received a create/update");
+          LOG.warn(json.getAsJsonObject("NewImage").toString());
+          LOG.warn(validTag.toString());
+          c.output(validTag, new Gson().fromJson(json.getAsJsonObject("NewImage"), Item.class));
+        }
+      } catch (Exception e) {
+        LOG.error("Error parsing record: " + c.element(), e);
+        c.output(invalidTag, c.element());
       }
     }
   }
@@ -115,10 +142,17 @@ public class SpannerStreamingWrite {
 
     @ProcessElement
     public void processElement(ProcessContext c) {
-      JsonObject json = JsonParser.parseString(c.element()).getAsJsonObject();
-      if (!json.has("NewImage")) {
-        LOG.info("received a delete");
-        c.output(new Gson().fromJson(json.getAsJsonObject("Keys"), Item.class));
+      try {
+        JsonObject json = JsonParser.parseString(c.element()).getAsJsonObject();
+        if (!json.has("NewImage")) {
+          LOG.warn("received a delete");
+          LOG.warn(json.getAsJsonObject("Keys").toString());
+          LOG.warn(validTag.toString());
+          c.output(validTag, new Gson().fromJson(json.getAsJsonObject("Keys"), Item.class));
+        }
+      } catch (Exception e) {
+        LOG.error("Error parsing record: " + c.element(), e);
+        c.output(invalidTag, c.element());
       }
     }
   }
@@ -126,64 +160,72 @@ public class SpannerStreamingWrite {
   static class UpdateMutations extends DoFn<Item, Mutation> {
 
     String table;
+    String serviceId;
 
-    public UpdateMutations(String table) {
+    public UpdateMutations(String table,String serviceId) {
       this.table = table;
+      this.serviceId = serviceId;
     }
 
     @ProcessElement
     public void processElement(ProcessContext c) {
       Item item = c.element();
-      LOG.info("Creating new/update Mutation for " + item.Username.S);
       Mutation.WriteBuilder mutation = Mutation.newReplaceBuilder(table);
 
       try {
-        // [START mapping]
-        mutation.set("Username").to(item.Username.S);
+        mutation.set("userId").to(item.object_id.S);
+        mutation.set("serviceId").to(serviceId);
+        mutation.set("name").to(item.attr_name.S);
+        mutation.set("lastUpdate").to(item.attr_time.N);
 
-        Optional.ofNullable(item.Zipcode).ifPresent(x -> {
-          mutation.set("Zipcode").to(Integer.parseInt(x.N));
+        Optional.ofNullable(item.attr_string).ifPresent(x -> {
+          mutation.set("stringValue").to(item.attr_string.S);
+        });
+        Optional.ofNullable(item.attr_value).ifPresent(x -> {
+          mutation.set("integerValue").to(item.attr_value.N);
         });
 
-        Optional.ofNullable(item.Subscribed).ifPresent(x -> {
-          mutation.set("Subscribed").to(Boolean.parseBoolean(x.BOOL));
-        });
-
-        Optional.ofNullable(item.ReminderDate).ifPresent(x -> {
-          mutation.set("ReminderDate").to(Date.parseDate(x.S));
-        });
-
-        Optional.ofNullable(item.PointsEarned).ifPresent(x -> {
-          mutation.set("PointsEarned").to(Integer.parseInt(x.N));
-        });
-        // [END mapping]
+        // mutation.set("userId").to(record.Item.object_id.S);
+        // mutation.set("serviceId").to(serviceId);
+        // mutation.set("name").to(record.Item.attr_name.S);
+        // mutation.set("lastUpdate").to(record.Item.attr_time.N);
+        // Optional.ofNullable(record.Item.attr_string).ifPresent(x -> {
+        //   mutation.set("stringValue").to(record.Item.attr_string.S);
+        // });
+        // Optional.ofNullable(record.Item.attr_value).ifPresent(x -> {
+        //   mutation.set("integerValue").to(record.Item.attr_value.N);
+        // });
 
         c.output(mutation.build());
 
       } catch (Exception ex) {
-        LOG.error("Unable to create mutation", ex);
+        LOG.error("Unable to create mutation for record: " + item, ex);
+        c.output(invalidTag, new Gson().toJson(item));
       }
-
     }
-
   }
 
   static class DeleteMutations extends DoFn<Item, Mutation> {
 
     String table;
+    String serviceId;
 
-    public DeleteMutations(String table) {
+    public DeleteMutations(String table,String serviceId) {
       this.table = table;
+      this.serviceId = serviceId;
     }
 
     @ProcessElement
     public void processElement(ProcessContext c) {
-      Item item = c.element();
-      LOG.info("Creating delete mutation for " + item.Username.S);
-      Mutation mutation = Mutation.delete(table, com.google.cloud.spanner.Key.of(item.Username.S));
-      c.output(mutation);
+      try {
+        Item item = c.element();
+        Mutation mutation = Mutation.delete(table, com.google.cloud.spanner.Key.of(serviceId,item.object_id.S,item.attr_name.S));
+        c.output(mutation);
+      } catch (Exception e) {
+        LOG.error("Error parsing record: " + c.element(), e);
+        c.output(invalidTag, c.element().toString());
+      }
     }
-
   }
 
   public static void main(String[] args) {
@@ -191,28 +233,31 @@ public class SpannerStreamingWrite {
 
     Pipeline p = Pipeline.create(options);
 
-    // Streaming pipeline, provide full subscription path
     PCollection<String> messages = p.apply("Reading from PubSub",
         PubsubIO.readStrings().fromSubscription(options.getSubscription()));
 
-    // Choose Update Type
-    // create mutations for creates and updates
-    PCollection<Mutation> updates = messages.apply("Create-or-Update?",
-            ParDo.of(new CreateUpdateItems()))
-        .apply("CU->Mutations", ParDo.of(new UpdateMutations(options.getTable())));
-    // create mutations for deletes
-    PCollection<Mutation> deletes = messages.apply("Delete?", ParDo.of(new DeleteItems()))
-        .apply("D->Mutations",
-            ParDo.of(new DeleteMutations(options.getTable())));
+    PCollectionTuple parsedCreateUpdate = messages.apply("Create-or-Update?",
+        ParDo.of(new CreateUpdateItems()).withOutputTags(validTag, TupleTagList.of(invalidTag)));
 
-    // Merge both sets of mutations
+    PCollectionTuple parsedDelete = messages.apply("Delete?",
+        ParDo.of(new DeleteItems()).withOutputTags(validTag, TupleTagList.of(invalidTag)));
+
+    PCollection<Item> validCreateUpdateRecords = parsedCreateUpdate.get(validTag);
+    PCollection<Item> validDeleteRecords = parsedDelete.get(validTag);
+    PCollection<String> deadLetters = PCollectionList.of(parsedCreateUpdate.get(invalidTag))
+        .and(parsedDelete.get(invalidTag))
+        .apply(Flatten.pCollections());
+
+    PCollection<Mutation> updates = validCreateUpdateRecords.apply("CU->Mutations",
+        ParDo.of(new UpdateMutations(options.getTable(),options.getServiceId())));
+
+    PCollection<Mutation> deletes = validDeleteRecords.apply("D->Mutations",
+        ParDo.of(new DeleteMutations(options.getTable(),options.getServiceId())));
+
     PCollectionList<Mutation> merged = PCollectionList.of(updates).and(deletes);
 
-    // Create fixed windows on unbounded (pub/sub) source
-    // Note: you may want to adjust the delay time and lateness value based
-    //       on your use cases
     PCollection<Mutation> mergedWindowed = merged.apply("Merging Mutations",
-            Flatten.<Mutation>pCollections())
+            Flatten.pCollections())
         .apply("Creating Windows", Window
             .<Mutation>into(
                 FixedWindows.of(Duration.standardSeconds(Long.parseLong(options.getWindow()))))
@@ -221,56 +266,46 @@ public class SpannerStreamingWrite {
                     .plusDelayOf(Duration.standardSeconds(10)))
             .withAllowedLateness(Duration.standardMinutes(300)).discardingFiredPanes());
 
-    // commit changes to Spanner
     mergedWindowed.apply("Commit->Spanner",
         SpannerIO.write().withInstanceId(options.getInstanceId())
             .withDatabaseId(options.getDatabaseId()).withBatchSizeBytes(0));
 
+    String deadLetterFiles = "gs://" + options.getDeadLetterBucket() + "/stream/deadletters/list.json";
+    deadLetters
+    .apply(Window.into(FixedWindows.of(Duration.standardMinutes(1))))
+    .apply("WriteDeadLetters", TextIO.write()
+        .to(deadLetterFiles)
+        .withWindowedWrites()
+        .withNumShards(1)
+        .withSuffix(".json"));
     p.run();
-
   }
 
-  // JSON mapping item to object
-  // [START GSON]
   public static class Item implements Serializable {
-
-    private Username Username;
-    private PointsEarned PointsEarned;
-    private Subscribed Subscribed;
-    private ReminderDate ReminderDate;
-    private Zipcode Zipcode;
-
+    private ObjectId object_id;
+    private AttrName attr_name;
+    private AttrTime attr_time;
+    private AttrString attr_string;
+    private AttrValue attr_value;
   }
 
-  public static class Username implements Serializable {
-
+  public static class ObjectId implements Serializable {
     private String S;
-
   }
 
-  public static class PointsEarned implements Serializable {
-
-    private String N;
-
-  }
-
-  public static class Subscribed implements Serializable {
-
-    private String BOOL;
-
-  }
-
-  public static class ReminderDate implements Serializable {
-
+  public static class AttrName implements Serializable {
     private String S;
-
   }
 
-  public static class Zipcode implements Serializable {
+  public static class AttrString implements Serializable {
+    private String S;
+  }
 
+  public static class AttrTime implements Serializable {
     private String N;
-
   }
-  // [END GSON]
 
+  public static class AttrValue implements Serializable {
+    private String N;
+  }
 }

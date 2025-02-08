@@ -14,29 +14,6 @@
  * limitations under the License.
  */
 
-package com.example.spanner_migration;
-
-import static org.apache.beam.sdk.io.Compression.GZIP;
-
-import com.google.cloud.Date;
-import com.google.cloud.spanner.Mutation;
-import com.google.gson.Gson;
-import java.io.Serializable;
-import java.util.Optional;
-import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.io.TextIO;
-import org.apache.beam.sdk.io.gcp.spanner.SpannerIO;
-import org.apache.beam.sdk.options.Description;
-import org.apache.beam.sdk.options.PipelineOptions;
-import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.sdk.options.Validation;
-import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.values.PCollection;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-
 /*
 ## How to run
 mvn clean
@@ -48,7 +25,9 @@ mvn exec:java \
                  --instanceId=my-instance-id \
                  --databaseId=my-database-id \
                  --table=my-table \
+                 --serviceId={service_id} \
                  --importBucket=my-import-bucket \
+                 --deadLetterBucket=my-dead-letter-bucket \
                  --runner=DataflowRunner \
                  --region=my-gcp-region"
 
@@ -56,12 +35,44 @@ Note: After a successful DynamoDB export to the import bucket,
 the bucket should contain gzip JSON files.
 */
 
-@SuppressWarnings("serial")
+package com.example.spanner_migration;
+
+import static org.apache.beam.sdk.io.Compression.GZIP;
+
+import com.google.cloud.Date;
+import com.google.cloud.spanner.Mutation;
+import com.google.gson.Gson;
+import java.io.Serializable;
+import java.util.Optional;
+import java.util.Arrays;
+import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.io.TextIO;
+import org.apache.beam.sdk.io.gcp.spanner.SpannerIO;
+import org.apache.beam.sdk.options.Description;
+import org.apache.beam.sdk.options.PipelineOptions;
+import org.apache.beam.sdk.options.PipelineOptionsFactory;
+import org.apache.beam.sdk.options.Validation;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.WithKeys;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.TupleTagList;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 public class SpannerBulkWrite {
 
   private static final Logger LOG = LoggerFactory.getLogger(SpannerBulkWrite.class);
 
   public interface Options extends PipelineOptions {
+
+    @Description("Service ID to write to")
+    @Validation.Required
+    String getServiceId();
+
+    void setServiceId(String value);
 
     @Description("Spanner instance ID to write to")
     @Validation.Required
@@ -81,30 +92,43 @@ public class SpannerBulkWrite {
 
     void setTable(String value);
 
-
     @Description("Location of your GCS Bucket with your exported database files")
     @Validation.Required
     String getImportBucket();
 
     void setImportBucket(String value);
 
+    @Description("Location of your GCS Bucket for dead letter queue")
+    @Validation.Required
+    String getDeadLetterBucket();
+
+    void setDeadLetterBucket(String value);
   }
+
+  static final TupleTag<Record> validRecordsTag = new TupleTag<Record>(){};
+  static final TupleTag<String> deadLetterTag = new TupleTag<String>(){};
 
   static class ParseRecords extends DoFn<String, Record> {
 
     @ProcessElement
     public void processElement(ProcessContext c) {
-      c.output(new Gson().fromJson(c.element(), Record.class));
-      //In a production system, you should use a dead letter queue
+      try {
+        c.output(validRecordsTag, new Gson().fromJson(c.element(), Record.class));
+      } catch (Exception e) {
+        LOG.error("Error parsing record: " + c.element(), e);
+        c.output(deadLetterTag, c.element());
+      }
     }
   }
 
   static class CreateRecordMutations extends DoFn<Record, Mutation> {
 
     String table;
+    String serviceId;
 
-    public CreateRecordMutations(String table) {
+    public CreateRecordMutations(String table, String serviceId) {
       this.table = table;
+      this.serviceId = serviceId;
     }
 
     @ProcessElement
@@ -114,109 +138,85 @@ public class SpannerBulkWrite {
       Mutation.WriteBuilder mutation = Mutation.newInsertOrUpdateBuilder(table);
 
       try {
-        // [START mapping]
-        mutation.set("Username").to(record.Item.Username.S);
-
-        Optional.ofNullable(record.Item.Zipcode).ifPresent(x -> {
-          mutation.set("Zipcode").to(Integer.parseInt(x.N));
+        mutation.set("userId").to(record.Item.object_id.S);
+        mutation.set("serviceId").to(serviceId);
+        mutation.set("name").to(record.Item.attr_name.S);
+        mutation.set("lastUpdate").to(record.Item.attr_time.N);
+        Optional.ofNullable(record.Item.attr_string).ifPresent(x -> {
+          mutation.set("stringValue").to(record.Item.attr_string.S);
         });
-
-        Optional.ofNullable(record.Item.Subscribed).ifPresent(x -> {
-          mutation.set("Subscribed").to(Boolean.parseBoolean(x.BOOL));
+        Optional.ofNullable(record.Item.attr_value).ifPresent(x -> {
+          mutation.set("integerValue").to(record.Item.attr_value.N);
         });
-
-        Optional.ofNullable(record.Item.ReminderDate).ifPresent(x -> {
-          mutation.set("ReminderDate").to(Date.parseDate(x.S));
-        });
-
-        Optional.ofNullable(record.Item.PointsEarned).ifPresent(x -> {
-          mutation.set("PointsEarned").to(Integer.parseInt(x.N));
-        });
-        // [END mapping]
 
         c.output(mutation.build());
 
       } catch (Exception ex) {
-        LOG.error("Unable to create mutation", ex);
+        LOG.error("Unable to create mutation for record: " + record, ex);
+        c.output(deadLetterTag, new Gson().toJson(record));
       }
     }
   }
 
   public static void main(String[] args) {
+    System.out.println("args:" + Arrays.toString(args));
     Options options = PipelineOptionsFactory.fromArgs(args).withValidation().as(Options.class);
 
     Pipeline p = Pipeline.create(options);
 
-    // file pattern to only grab data export files (which contain dashes in filename)
-    // and ignore export job metadata files
-    String inputFiles = "gs://" + options.getImportBucket() + "/**/*.json.gz";
+    String inputFiles = "gs://" + options.getImportBucket() + "/" + options.getServiceId() + "/**/*.json.gz";
+    String deadLetterFiles = "gs://" + options.getDeadLetterBucket() + "/" + options.getServiceId() + "/deadletters/list.json";
 
-    // (Source) read DynamoDB items from export files
     PCollection<String> input = p.apply("ReadItems",
         TextIO.read().from(inputFiles).withCompression(GZIP));
 
-    // Parse the DynamoDB items into objects
-    PCollection<Record> records = input.apply("ParseRecords", ParDo.of(new ParseRecords()));
+    PCollectionTuple parsedRecords = input.apply("ParseRecords", ParDo.of(new ParseRecords())
+        .withOutputTags(validRecordsTag, TupleTagList.of(deadLetterTag)));
 
-    // Create Cloud Spanner mutations using parsed Record objects
-    PCollection<Mutation> mutations = records.apply("CreateRecordMutations",
-        ParDo.of(new CreateRecordMutations(options.getTable())));
+    PCollection<Record> validRecords = parsedRecords.get(validRecordsTag);
+    PCollection<String> deadLetters = parsedRecords.get(deadLetterTag);
 
-    // (Sink) write the Mutations to Spanner
+    PCollection<Mutation> mutations = validRecords.apply("CreateRecordMutations",
+        ParDo.of(new CreateRecordMutations(options.getTable(), options.getServiceId())));
+
     mutations.apply("WriteRecords", SpannerIO.write()
         .withInstanceId(options.getInstanceId())
         .withDatabaseId(options.getDatabaseId()));
 
-    p.run().waitUntilFinish();
+    deadLetters.apply("WriteDeadLetters", TextIO.write().to(deadLetterFiles).withSuffix(".json"));
 
+    p.run().waitUntilFinish();
   }
 
-  // JSON mapping item to object
-  // [START GSON]
   public static class Record implements Serializable {
-
     private Item Item;
-
   }
 
   public static class Item implements Serializable {
-
-    private Username Username;
-    private PointsEarned PointsEarned;
-    private Subscribed Subscribed;
-    private ReminderDate ReminderDate;
-    private Zipcode Zipcode;
-
+    private ObjectId object_id;
+    private AttrName attr_name;
+    private AttrTime attr_time;
+    private AttrString attr_string;
+    private AttrValue attr_value;
   }
 
-  public static class Username implements Serializable {
-
+  public static class ObjectId implements Serializable {
     private String S;
-
   }
 
-  public static class PointsEarned implements Serializable {
-
-    private String N;
-
-  }
-
-  public static class Subscribed implements Serializable {
-
-    private String BOOL;
-
-  }
-
-  public static class ReminderDate implements Serializable {
-
+  public static class AttrName implements Serializable {
     private String S;
-
   }
 
-  public static class Zipcode implements Serializable {
+  public static class AttrString implements Serializable {
+    private String S;
+  }
 
+  public static class AttrTime implements Serializable {
     private String N;
-
   }
-  // [END GSON]
+
+  public static class AttrValue implements Serializable {
+    private String N;
+  }
 }
